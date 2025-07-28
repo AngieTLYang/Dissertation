@@ -7,7 +7,7 @@ url = "https://www.youtube.com/watch?v=EYEyYpLpsFs"
 #url = "https://www.youtube.com/watch?v=XBdUrmf4-oQ"
 yt = YouTube(url)
 
-print(f"🎬 Downloading: {yt.title}")
+print(f" Downloading: {yt.title}")
 yt.streams.get_highest_resolution().download(
     output_path="C:/Users/88690/Desktop/Dissertation/paddleOCR"
 )
