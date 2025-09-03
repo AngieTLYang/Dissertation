@@ -13,17 +13,23 @@ import test_owlv2_singleImage as owl  # assuming you wrapped OWL detection as a 
 save_folder = os.path.join(os.path.dirname(__file__), "imageFromPhone")
 os.makedirs(save_folder, exist_ok=True)
 
-clients = []
-
+# Globals
+image_clients = []     # sockets for image streaming
+control_clients = []   # sockets for control + text
 latest_image_path = os.path.join(save_folder, "latest.jpg")
 processing_image_path = os.path.join(save_folder, "processing.jpg")
 processing_lock = threading.Lock()
 new_image_event = threading.Event()
+pause_event = threading.Event()
+pause_event.set()  # allow processing initially
 
 
-def handle_client(client_socket, addr):
-    print(f"Client connected: {addr}")
-    clients.append(client_socket)
+# -------------------------
+# Image handling
+# -------------------------
+def handle_image_client(client_socket, addr):
+    print(f"[ImageClient] Connected: {addr}")
+    image_clients.append(client_socket)
     try:
         while True:
             # Read length of incoming image
@@ -31,6 +37,7 @@ def handle_client(client_socket, addr):
             if not length_bytes:
                 break
             length = int.from_bytes(length_bytes, "big")
+
             # Read image data
             data = b""
             while len(data) < length:
@@ -38,60 +45,80 @@ def handle_client(client_socket, addr):
                 if not packet:
                     break
                 data += packet
+
             # Save latest image
             with open(latest_image_path, "wb") as f:
                 f.write(data)
-            print(f"Received image ({len(data)} bytes) from {addr}, saved as latest.jpg")
+            print(f"[ImageClient] Received image ({len(data)} bytes) from {addr}, saved as latest.jpg")
+
             # Notify processing thread
             new_image_event.set()
     except Exception as e:
-        print(f"Client {addr} disconnected: {e}")
+        print(f"[ImageClient] {addr} disconnected: {e}")
     finally:
-        clients.remove(client_socket)
+        if client_socket in image_clients:
+            image_clients.remove(client_socket)
         client_socket.close()
 
 
-def send_command_to_clients(cmd: str):
-    for client in clients:
+# -------------------------
+# Control/Text handling
+# -------------------------
+def handle_control_client(client_socket, addr):
+    print(f"[ControlClient] Connected: {addr}")
+    control_clients.append(client_socket)
+    try:
+        while True:
+            cmd = client_socket.recv(1024).decode().strip()
+            if not cmd:
+                break
+            print(f"[ControlClient] Received command from {addr}: {cmd}")
+
+            if cmd == "RESUME":
+                pause_event.set()
+    except Exception as e:
+        print(f"[ControlClient] {addr} disconnected: {e}")
+
+
+def send_to_control_clients(msg: str):
+    for client in control_clients:
         try:
-            client.send(cmd.encode())
+            client.send((msg + "\n").encode())
         except:
             pass
 
 
+# -------------------------
+# Image Processing Loop
+# -------------------------
 def process_images_loop():
     while True:
-        # Wait until a new image is available
         new_image_event.wait()
         new_image_event.clear()
 
-        # Copy latest image to processing file (so incoming images won't overwrite it)
+        # Wait here if paused
+        pause_event.wait()
+
+        # Copy latest image to processing file
         with processing_lock:
             shutil.copy2(latest_image_path, processing_image_path)
 
-        # Call your OWL detection function
         try:
             print("Processing image with OWL...")
-            # Assuming you wrapped your OWL detection as:
-            # result = owl.detect_objects(image_path)
-            # where result returns list of detected objects or counts
             result = owl.detect_pens(processing_image_path)
-
-            # Check for at least 2 pens
             pen_count = result[0]
             print(f"Detected {pen_count} pens in the image.")
 
             if pen_count >= 2:
                 print("✅ At least 2 pens detected, sending PAUSE command.")
-                send_command_to_clients("PAUSE")
-            else:
-                print("⏩ Less than 2 pens, sending RESUME command.")
-                send_command_to_clients("RESUME")
+                send_to_control_clients("PAUSE")
+                pause_event.clear()  # pause loop until client sends RESUME
+                send_to_control_clients("answer")
 
         except Exception as e:
             print(f"Error during OWL processing: {e}")
 
-        # Check if new image came in during processing
+        # Check if a new image arrived during processing
         if os.path.exists(latest_image_path):
             if os.path.getmtime(latest_image_path) > os.path.getmtime(processing_image_path):
                 print("New image received during processing, continuing loop...")
@@ -101,26 +128,44 @@ def process_images_loop():
 # -------------------------
 # Server setup
 # -------------------------
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind(("0.0.0.0", 12345))
-server.listen(5)
-print("Server running on port 12345...")
-
-
-def accept_clients():
+def start_image_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("0.0.0.0", 12345))
+    server.listen(5)
+    print("Image server running on port 12345...")
     while True:
         client_socket, addr = server.accept()
-        threading.Thread(target=handle_client, args=(client_socket, addr), daemon=True).start()
+        threading.Thread(target=handle_image_client, args=(client_socket, addr), daemon=True).start()
 
 
-threading.Thread(target=accept_clients, daemon=True).start()
+def start_control_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("0.0.0.0", 12346))
+    server.listen(5)
+    print("Control server running on port 12346...")
+    while True:
+        client_socket, addr = server.accept()
+        threading.Thread(target=handle_control_client, args=(client_socket, addr), daemon=True).start()
+
+
+# -------------------------
+# Start everything
+# -------------------------
+threading.Thread(target=start_image_server, daemon=True).start()
+threading.Thread(target=start_control_server, daemon=True).start()
 threading.Thread(target=process_images_loop, daemon=True).start()
 
-# Optional command loop for manual commands
+# Optional manual control
 while True:
-    cmd = input("Enter command (PAUSE/RESUME/EXIT): ").strip().upper()
-    if cmd == "EXIT":
+    cmd = input("Enter command (PAUSE/RESUME/EXIT/TEXT <msg>): ").strip()
+    if cmd.upper() == "EXIT":
         break
-    send_command_to_clients(cmd)
-
-
+    elif cmd.upper() == "RESUME":
+        pause_event.set()
+        send_to_control_clients("RESUME")
+    elif cmd.upper() == "PAUSE":
+        pause_event.clear()
+        send_to_control_clients("PAUSE")
+    elif cmd.startswith("TEXT "):
+        text = cmd[5:]
+        send_to_control_clients(f"TEXT:{text}")
